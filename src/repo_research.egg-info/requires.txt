@@ -1,0 +1,10 @@
+httpx>=0.25
+PyYAML>=6
+pypdf>=4
+python-docx>=1
+openpyxl>=3
+
+[dev]
+pytest>=8
+reportlab>=4
+psutil>=5

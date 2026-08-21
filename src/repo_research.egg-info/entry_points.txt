@@ -1,0 +1,3 @@
+[console_scripts]
+repo-research = repo_research.cli:main
+repo-research-benchmark = repo_research.benchmark:main

@@ -1,0 +1,14 @@
+{
+  "repository": "/path/to/synthetic-repository",
+  "depth": "deep",
+  "cases": [
+    {
+      "question": "When did the Atlas Unit become operational?",
+      "mode": "evidence",
+      "expected": [
+        {"source_path": "primary.md", "contains": "Operations began on 1 July 2023"},
+        {"source_path": "later-summary.txt", "contains": "June 2023", "contradictory": true}
+      ]
+    }
+  ]
+}

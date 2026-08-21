@@ -1,0 +1,14 @@
+Metadata-Version: 2.4
+Name: repo-research
+Version: 0.3.0
+Summary: Local-first repository evidence retrieval using Ollama
+Requires-Python: >=3.10
+Requires-Dist: httpx>=0.25
+Requires-Dist: PyYAML>=6
+Requires-Dist: pypdf>=4
+Requires-Dist: python-docx>=1
+Requires-Dist: openpyxl>=3
+Provides-Extra: dev
+Requires-Dist: pytest>=8; extra == "dev"
+Requires-Dist: reportlab>=4; extra == "dev"
+Requires-Dist: psutil>=5; extra == "dev"

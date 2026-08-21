@@ -1,0 +1,4 @@
+interface:
+  display_name: "Local Repository Research"
+  short_description: "Reduce frontier reading with local evidence screening"
+  default_prompt: "Use $local-repo-research to screen this repository locally and adjudicate from a compact evidence packet with selective source checks."
