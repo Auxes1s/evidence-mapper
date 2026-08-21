@@ -66,7 +66,7 @@ You need:
 - Ollama; and
 - a local model.
 
-The defaults target a 24 GB Apple Silicon Mac using `qwen3.5:9b-mlx`, a 32K context window, one generation at a time, and temperature 0.1.
+The local model and context settings are configurable based on your available hardware.
 
 ## Install
 
