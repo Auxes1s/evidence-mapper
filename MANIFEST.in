@@ -1,0 +1,5 @@
+include README.md
+include install.sh
+recursive-include skill *.md *.yaml
+recursive-include benchmark *.json *.md *.py
+recursive-include tests *.py

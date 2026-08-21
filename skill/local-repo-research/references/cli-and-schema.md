@@ -1,5 +1,28 @@
 # CLI and evidence contract
 
+Start or verify the local Ollama CLI service before searching:
+
+```sh
+if ! ollama list >/dev/null 2>&1; then
+  nohup ollama serve >/tmp/repo-research-ollama.log 2>&1 &
+  startup_attempt=0
+  until ollama list >/dev/null 2>&1; do
+    startup_attempt=$((startup_attempt + 1))
+    if [ "$startup_attempt" -ge 30 ]; then
+      tail -n 20 /tmp/repo-research-ollama.log >&2
+      exit 1
+    fi
+    sleep 1
+  done
+fi
+repo-research --health
+```
+
+Use `ollama serve`, not `ollama run`: `serve` provides the HTTP endpoint that
+`repo-research` needs, while `run` starts an interactive model session. If the
+server is available but health still fails, check that the configured model is
+installed (the default is `qwen3.5:9b-mlx`) and inspect the reported error.
+
 ```sh
 repo-research --health
 repo-research --path . --mode inventory --json

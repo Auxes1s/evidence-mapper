@@ -7,7 +7,9 @@ description: Reduce frontier file-reading by delegating repository-scale evidenc
 
 Use `repo-research` as a cost-saving local evidence scout. Qwen screens indexed
 repository text; Codex receives a bounded evidence packet and remains responsible
-for adjudication. Repository contents stay local.
+for adjudication. With the default loopback Ollama endpoint and local model,
+repository contents stay on the machine; custom endpoints or cloud-backed models
+change that privacy boundary.
 
 ## Route by economics and risk
 
@@ -24,17 +26,23 @@ Qwen can locate candidates for these claims but should not adjudicate them.
 
 ## Workflow
 
-1. Express the objective as focused, assessable propositions.
-2. Start with `quick --output-budget compact`; escalate depth or packet size only
+1. Run `repo-research --health` before the first search. If it fails because the
+   Ollama endpoint is unavailable, start the CLI server in the background with
+   `nohup ollama serve >/tmp/repo-research-ollama.log 2>&1 &`, wait up to 30
+   seconds for `ollama list` to succeed, and rerun the health check. Do not open
+   the Ollama GUI. If the server starts but health still fails, report the model
+   or configuration error instead of starting an interactive `ollama run` session.
+2. Express the objective as focused, assessable propositions.
+3. Start with `quick --output-budget compact`; escalate depth or packet size only
    when the expected audit value justifies more local work or frontier context.
-3. Judge promoted `E####` records first. Retrieve adjacent context or open the
+4. Judge promoted `E####` records first. Retrieve adjacent context or open the
    original only when the packet lacks the subject, amount, denominator, stage,
    date, authority, or conflicting decision needed for adjudication.
-4. Reuse a source check across propositions and count unique files opened when
+5. Reuse a source check across propositions and count unique files opened when
    evaluating context savings.
-5. Treat deterministic span validation as proof that text exists, not that the
+6. Treat deterministic span validation as proof that text exists, not that the
    claim is true. Separate what a document says from what the record establishes.
-6. Stop delegating when selective checks approach the likely direct-search
+7. Stop delegating when selective checks approach the likely direct-search
    workload. The local worker is defeated if Codex rereads the corpus.
 
 Use a separate contradiction or source-trace pass only for consequential claims.

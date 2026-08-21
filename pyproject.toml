@@ -6,6 +6,7 @@ build-backend = "setuptools.build_meta"
 name = "repo-research"
 version = "0.3.0"
 description = "Local-first repository evidence retrieval using Ollama"
+readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [
   "httpx>=0.25",
@@ -21,6 +22,9 @@ dev = ["pytest>=8", "reportlab>=4", "psutil>=5"]
 [project.scripts]
 repo-research = "repo_research.cli:main"
 repo-research-benchmark = "repo_research.benchmark:main"
+
+[project.urls]
+Repository = "https://github.com/Auxes1s/evidence-mapper"
 
 [tool.setuptools.packages.find]
 where = ["src"]

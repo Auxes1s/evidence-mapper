@@ -11,18 +11,45 @@ question -> format-aware extraction -> SQLite FTS candidates
          -> selective Codex expansion and final judgment
 ```
 
-No repository content is sent externally. Model access is isolated in `repo_research/ollama.py`. Requires Python 3.10+, Ollama, and a local model. Defaults for a 24 GB Apple Silicon Mac are `qwen3.5:9b-mlx`, 32K context, one generation, and temperature 0.1.
+With the default configuration, repository content is sent only to Ollama at the
+loopback endpoint `http://127.0.0.1:11434`; the package itself has no external
+model API integration. Overriding `ollama_url` or selecting a cloud-backed model
+changes that privacy boundary. Requires Python 3.10+, the Ollama CLI, and a local
+model. Defaults for a 24 GB Apple Silicon Mac are `qwen3.5:9b-mlx`, 32K context,
+one generation at a time, and temperature 0.1.
 
 Supported inputs include PDF, DOCX, XLSX/XLSM, CSV/TSV, text, Markdown, JSON/YAML/TOML/XML/HTML, LaTeX/BibTeX, logs, and common source code. PDF pages, DOCX headings/paragraphs/tables, spreadsheet sheets/headers/rows, and source lines are retained. Optional Tesseract OCR can index image-only PDFs without modifying the originals.
 
 ## Installation
 
-Install the CLI and bundled Codex skill:
+Start Ollama as a background CLI service and install the default local model. This
+does not open the Ollama application:
+
+```sh
+if ! ollama list >/dev/null 2>&1; then
+  nohup ollama serve >/tmp/repo-research-ollama.log 2>&1 &
+  startup_attempt=0
+  until ollama list >/dev/null 2>&1; do
+    startup_attempt=$((startup_attempt + 1))
+    if [ "$startup_attempt" -ge 30 ]; then
+      tail -n 20 /tmp/repo-research-ollama.log >&2
+      exit 1
+    fi
+    sleep 1
+  done
+fi
+ollama pull qwen3.5:9b-mlx
+```
+
+Then install the CLI and bundled Codex skill:
 
 ```sh
 ./install.sh
 repo-research --health
 ```
+
+`ollama serve` provides the HTTP endpoint used by `repo-research`. `ollama run`
+starts an interactive model session and is not a substitute for the service.
 
 Set `REPO_RESEARCH_INSTALL_ROOT`, `REPO_RESEARCH_BIN_DIR`, or
 `REPO_RESEARCH_SKILLS_DIR` to override their default user-local locations.
@@ -75,7 +102,8 @@ Invoke the user-wide skill as `$local-repo-research`, or let Codex select it for
 
 Lexical retrieval can miss passages with no shared terms. Model classifications remain fallible. Deterministic span validation proves text exists, not claim truth. OCR must be explicitly enabled. Legacy `.xls` is unsupported. Source hierarchy is configurable and not universal.
 
-The SMEP economics benchmark found that compact local screening reduced a
-conservative direct-frontier workload by about 80%, but authority-sensitive and
-stage-sensitive claims still required selective source inspection. See
-`benchmark/SMEP_ECONOMICS_2026-08-20.md` for the fixed ten-claim benchmark.
+In the fixed ten-proposition SMEP economics benchmark, compact local screening
+reduced the conservative retrieved-candidate-text comparator by about 80%, but
+authority-sensitive and stage-sensitive claims still required selective source
+inspection. This is a benchmark result, not a general performance guarantee. See
+`benchmark/SMEP_ECONOMICS_2026-08-20.md` for the complete scope and measurements.
