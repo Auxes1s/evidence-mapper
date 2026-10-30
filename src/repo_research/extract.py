@@ -1,8 +1,13 @@
 from __future__ import annotations
 
-import csv, hashlib, json, mimetypes, os, shutil, subprocess, tempfile
+import csv
+import hashlib
+import os
+import shutil
+import subprocess
+import tempfile
+from collections.abc import Iterable
 from pathlib import Path
-from typing import Iterable
 
 from docx import Document
 from openpyxl import load_workbook
@@ -35,6 +40,10 @@ def file_hash(path: Path, timeout: int | float | None = None) -> str:
 def stable_id(*parts: object) -> str:
     return hashlib.sha256("\x1f".join(str(x) for x in parts).encode()).hexdigest()[:24]
 
+def extraction_policy(cfg: dict) -> str:
+    return stable_id("extractors-v3",[(key,cfg.get(key)) for key in (
+        "chunk_chars","chunk_overlap_chars","ocr_image_only_pdfs","ocr_max_pages","ocr_dpi")])
+
 def _windows(text: str, size: int, overlap: int) -> Iterable[tuple[int, str]]:
     if len(text) <= size:
         yield 0, text
@@ -57,23 +66,32 @@ def _chunk_text(path: Path, rel: str, source_hash: str, text: str, cfg: dict,
         ls = base_line + text[:offset].count("\n") if base_line is not None else None
         le = ls + part.count("\n") if ls is not None else None
         loc = dict(location, line_start=ls, line_end=le)
-        out.append(Chunk(stable_id(rel, source_hash, location, ordinal, offset), rel,
+        logical_id=stable_id(rel,location,ordinal,offset,cfg["chunk_chars"],cfg["chunk_overlap_chars"])
+        parent_id=stable_id(rel,source_hash,location,"parent-v3")
+        out.append(Chunk(stable_id(rel, source_hash, location, ordinal, offset,extraction_policy(cfg)), rel,
                          path.suffix.lower().lstrip(".") or "text", source_hash,
-                         part.strip(), ordinal, **loc))
+                         part.strip(), ordinal, metadata={"logical_chunk_id":logical_id,
+                         "chunker_version":"structure-v3","parent_id":parent_id,
+                         "parser_policy":extraction_policy(cfg),
+                         **({"parent_text":text} if ordinal == 0 else {}),
+                         "extracted_char_start":offset,
+                         "extracted_char_end":offset+len(part)}, **loc))
     return [x for x in out if x.text]
 
-def _ocr_pdf(path: Path, rel: str, digest: str, page_count: int, cfg: dict) -> list[Chunk]:
+def _ocr_pdf(path: Path, rel: str, digest: str, page_numbers: Iterable[int], cfg: dict) -> tuple[list[Chunk], list[int]]:
     if not cfg.get("ocr_image_only_pdfs"):
-        return []
+        return [], list(page_numbers)
     pdftoppm, tesseract = shutil.which("pdftoppm"), shutil.which("tesseract")
     if not pdftoppm or not tesseract:
         raise RuntimeError("image-only PDF requires pdftoppm and tesseract for OCR")
-    limit = min(page_count, int(cfg.get("ocr_max_pages", 120)))
+    requested = list(page_numbers)
+    selected = requested[:int(cfg.get("ocr_max_pages", 120))]
     dpi = str(int(cfg.get("ocr_dpi", 200)))
     timeout = int(cfg.get("ocr_timeout_per_page_seconds", 90))
     out: list[Chunk] = []
+    empty_pages=[]
     with tempfile.TemporaryDirectory(prefix="repo-research-ocr-") as temp:
-        for page_no in range(1, limit + 1):
+        for page_no in selected:
             stem = str(Path(temp) / f"page-{page_no}")
             subprocess.run([pdftoppm, "-f", str(page_no), "-l", str(page_no), "-r", dpi,
                             "-png", "-singlefile", str(path), stem], check=True,
@@ -84,42 +102,54 @@ def _ocr_pdf(path: Path, rel: str, digest: str, page_count: int, cfg: dict) -> l
             text = result.stdout.strip()
             if text:
                 out += _chunk_text(path, rel, digest, text, cfg, page=page_no, section="OCR")
-    return out
+            else: empty_pages.append(page_no)
+    return out, empty_pages+requested[len(selected):]
 
-def extract_file(path: Path, root: Path, cfg: dict) -> tuple[list[Chunk], dict | None]:
-    rel, ext, digest = str(path.relative_to(root)), path.suffix.lower(), ""
+def extract_file(path: Path, root: Path, cfg: dict, source_hash: str | None = None) -> tuple[list[Chunk], dict | None]:
+    rel, ext, digest = str(path.relative_to(root)), path.suffix.lower(), source_hash or ""
     try:
-        digest = file_hash(path, cfg.get("file_timeout_seconds"))
+        digest = digest or file_hash(path, cfg.get("file_timeout_seconds"))
         if ext == ".pdf":
-            reader, out = PdfReader(str(path)), []
+            reader, out, missing_pages = PdfReader(str(path)), [], []
             for page_no, page in enumerate(reader.pages, 1):
                 text = page.extract_text() or ""
-                out += _chunk_text(path, rel, digest, text, cfg, page=page_no)
-            if not out:
-                out = _ocr_pdf(path, rel, digest, len(reader.pages), cfg)
+                if text.strip():
+                    out += _chunk_text(path, rel, digest, text, cfg, page=page_no)
+                else:
+                    missing_pages.append(page_no)
+            omitted_ocr_pages: list[int] = []
+            if missing_pages:
+                ocr, omitted_ocr_pages = _ocr_pdf(path, rel, digest, missing_pages, cfg)
+                out += ocr
             if not out: raise ValueError("PDF has no usable extractable text (OCR unavailable or produced no text)")
-            return out, None
+            unresolved = omitted_ocr_pages or ([p for p in missing_pages] if not cfg.get("ocr_image_only_pdfs") else [])
+            diagnostic = None
+            if unresolved:
+                diagnostic = {"source_path":rel,"source_hash":digest,"source_type":"pdf",
+                              "severity":"warning","error":"PDF pages had no extracted text",
+                              "omitted_pages":unresolved}
+            return out, diagnostic
         if ext == ".docx":
-            doc, out, heading, para = Document(str(path)), [], None, 0
-            buffer, start = [], 1
-            def flush():
-                nonlocal buffer, start, out
-                if buffer:
-                    out += _chunk_text(path, rel, digest, "\n".join(buffer), cfg,
-                                       section=heading, paragraph_start=start,
-                                       paragraph_end=para)
-                    buffer = []
-            for p in doc.paragraphs:
-                para += 1
-                if p.style and p.style.name.startswith("Heading"):
-                    flush(); heading = p.text.strip(); start = para
-                elif p.text.strip():
-                    if not buffer: start = para
-                    buffer.append(p.text)
-            flush()
-            for ti, table in enumerate(doc.tables, 1):
-                rows = [" | ".join(c.text.strip() for c in row.cells) for row in table.rows]
-                out += _chunk_text(path, rel, digest, "\n".join(rows), cfg, section=f"Table {ti}")
+            from docx.table import Table
+            from docx.text.paragraph import Paragraph
+            doc, out, heading, para, table_no = Document(str(path)), [], None, 0, 0
+            for child in doc.element.body:
+                if child.tag.endswith("}p"):
+                    p = Paragraph(child, doc); para += 1
+                    if p.style and p.style.name.startswith("Heading"):
+                        heading = p.text.strip()
+                    if p.text.strip():
+                        out += _chunk_text(path,rel,digest,p.text,cfg,section=heading,
+                                           paragraph_start=para,paragraph_end=para)
+                elif child.tag.endswith("}tbl"):
+                    table_no += 1
+                    table = Table(child, doc)
+                    rows = [" | ".join(c.text.strip() for c in row.cells) for row in table.rows]
+                    if rows:
+                        for row_no, row in enumerate(rows[1:] or rows, 2 if len(rows)>1 else 1):
+                            out += _chunk_text(path,rel,digest,"HEADERS: "+rows[0]+"\nROW "+str(row_no)+": "+row,
+                                               cfg,section=f"{heading or ''} / Table {table_no}",
+                                               row_start=row_no,row_end=row_no)
             return out, None
         if ext in {".xlsx", ".xlsm"}:
             wb, out = load_workbook(path, read_only=True, data_only=True), []
@@ -148,14 +178,22 @@ def extract_file(path: Path, root: Path, cfg: dict) -> tuple[list[Chunk], dict |
                 out += _chunk_text(path, rel, digest, "\n".join(rendered), cfg,
                                    row_start=start + 1, row_end=min(len(rows), start + 60))
             return out, None
-        text = path.read_text(encoding="utf-8", errors="replace")
-        return _chunk_text(path, rel, digest, text, cfg, line_start=1), None
+        raw = path.read_bytes()
+        try:
+            text = raw.decode("utf-8")
+            diagnostic = None
+        except UnicodeDecodeError as exc:
+            text = raw.decode("utf-8", errors="replace")
+            diagnostic = {"source_path":rel,"source_hash":digest,"source_type":ext.lstrip("."),
+                          "severity":"warning","error":"Invalid UTF-8 bytes were replaced",
+                          "decode_error_start":exc.start}
+        return _chunk_text(path, rel, digest, text, cfg, line_start=1), diagnostic
     except Exception as exc:
         return [], {"source_path": rel, "source_hash": digest, "error": str(exc), "source_type": ext.lstrip(".")}
 
-def eligible_files(root: Path, cfg: dict, failures: list[dict] | None = None) -> list[Path]:
+def discover_files(root: Path, cfg: dict, failures: list[dict] | None = None) -> tuple[list[Path], list[dict]]:
     from fnmatch import fnmatch
-    out = []
+    out, manifest = [], []
     failures = failures if failures is not None else []
     ignores, includes, excludes = set(cfg["ignore_dirs"]), cfg.get("include", []), cfg.get("exclude", [])
     def walk_error(exc: OSError) -> None:
@@ -168,12 +206,30 @@ def eligible_files(root: Path, cfg: dict, failures: list[dict] | None = None) ->
             p = current_path / name
             try:
                 rel = str(p.relative_to(root))
-                if p.stat().st_size > cfg["max_file_bytes"]: continue
-                if includes and not any(fnmatch(rel, x) for x in includes): continue
-                if any(fnmatch(rel, x) for x in excludes): continue
-                if p.suffix.lower() in SUPPORTED or p.name.lower() in {"dockerfile", "makefile", "license"}:
+                st = p.stat()
+                item = {"source_path":rel,"source_type":p.suffix.lower().lstrip(".") or p.name.lower(),
+                        "size":st.st_size,"mtime":st.st_mtime,"status":"eligible","reason":None,
+                        "parser_version":"extractors-v3"}
+                if includes and not any(fnmatch(rel, x) for x in includes):
+                    item.update(status="excluded", reason="not matched by include policy")
+                elif any(fnmatch(rel, x) for x in excludes):
+                    item.update(status="excluded", reason="matched exclude policy")
+                elif st.st_size > cfg["max_file_bytes"]:
+                    item.update(status="oversized", reason=f"exceeds max_file_bytes={cfg['max_file_bytes']}")
+                elif not (p.suffix.lower() in SUPPORTED or p.name.lower() in {"dockerfile", "makefile", "license"}):
+                    item.update(status="unsupported", reason="unsupported file type")
+                else:
                     out.append(p)
+                manifest.append(item)
             except OSError as exc:
-                failures.append({"source_path": str(p), "source_hash": "", "error": str(exc),
-                                 "source_type": p.suffix.lower().lstrip(".") or "filesystem"})
-    return sorted(out)
+                record={"source_path":str(p),"source_hash":"","error":str(exc),
+                        "source_type":p.suffix.lower().lstrip(".") or "filesystem"}
+                failures.append(record)
+                manifest.append({"source_path":str(p),"source_type":record["source_type"],
+                                 "status":"failed","reason":str(exc),"size":None,"mtime":None})
+    return sorted(out), sorted(manifest, key=lambda x:x["source_path"])
+
+
+def eligible_files(root: Path, cfg: dict, failures: list[dict] | None = None) -> list[Path]:
+    files, _ = discover_files(root, cfg, failures)
+    return files

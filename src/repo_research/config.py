@@ -3,6 +3,7 @@ from __future__ import annotations
 from copy import deepcopy
 from pathlib import Path
 from typing import Any
+
 import yaml
 
 DEFAULTS: dict[str, Any] = {
@@ -18,11 +19,22 @@ DEFAULTS: dict[str, Any] = {
     "candidate_limit": 12,
     "max_prompt_chars": 48000,
     "max_output_tokens": 1800,
-    "frontier_output_budget": "standard",
+    "context_safety_margin_tokens": 1024,
+    "embedding_model": "qwen3-embedding:0.6b",
+    "embedding_batch_size": 32,
+    "embedding_query_instruction": "Retrieve source passages relevant to the research proposition.",
+    "frontier_output_budget": "compact",
+    "bundle_budget_tokens": 4000,
+    "max_research_rounds": {"quick": 2, "standard": 4, "deep": 7},
+    "max_calls_per_proposition": {"quick": 8, "standard": 16, "deep": 32},
+    "max_calls_per_run": 96,
+    "max_context_followups": 8,
+    "tokenizer_path": None,
     "frontier_output_budgets": {"compact": 750, "standard": 1500, "expanded": 4000},
     "max_promoted_records": 12,
     "max_file_bytes": 20_000_000,
     "file_timeout_seconds": 120,
+    "archive_source_bytes": False,
     "ocr_image_only_pdfs": False,
     "ocr_max_pages": 120,
     "ocr_dpi": 200,
@@ -70,7 +82,10 @@ def ensure_repo_config(root: Path, cfg: dict[str, Any]) -> Path:
     if not path.exists():
         keys = ("model", "backend", "ollama_url", "context_tokens", "max_parallel_jobs",
                 "temperature", "frontier_output_budget", "frontier_output_budgets",
-                "max_promoted_records", "include", "exclude", "source_hierarchy")
+                "max_promoted_records", "context_safety_margin_tokens", "archive_source_bytes",
+                "embedding_model", "embedding_batch_size", "embedding_query_instruction",
+                "bundle_budget_tokens", "max_research_rounds", "max_calls_per_proposition",
+                "max_calls_per_run", "max_context_followups", "include", "exclude", "source_hierarchy")
         path.write_text(yaml.safe_dump({k: cfg[k] for k in keys}, sort_keys=False), encoding="utf-8")
     gitignore = root / ".gitignore"
     if (root / ".git").exists() and gitignore.exists():

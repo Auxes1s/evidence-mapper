@@ -1,232 +1,181 @@
 # repo-research
 
-**Let a small local AI search your files so your main AI agent does not have to.**
+**Let a local evidence scout search your files while the main agent makes the final judgment.**
 
-`repo-research` is a local research assistant for Codex and other AI agents. Give it a folder and a question. It searches the folder on your computer, checks useful passages against the source text, and returns a small evidence packet for the stronger agent to reason about.
+`repo-research` processes large folders through bounded local-model tasks. Research
+memory lives in a persistent, source-linked workspace, so each call can work with
+a small context window. Codex receives a compact coverage overview and fetches
+coherent evidence bundles when needed.
 
 ```text
-large folder of files
-        |
-        v
-repo-research: local search + local model
-        |
-        v
-small set of checked evidence
-        |
-        v
-Codex: closer inspection and final judgment
+documents → versioned text and structure → keyword + embedding indexes
+                                               ↓
+                                      research scheduler
+                                       ↕             ↕
+                              bounded local tasks   evidence ledger
+                                                         ↓
+                                              proposition bundles
+                                                         ↓
+                                             overview → Codex fetch
 ```
-
-The local model does the searching. The stronger model makes the final judgment.
-
-## Why this exists
-
-Research across a large folder can consume much of an AI agent's context before the real reasoning begins. The agent has to open files, search them, compare passages, and retain all that material just to find the few sources that matter.
-
-`repo-research` moves most of that discovery work to local compute. It can:
-
-- read common documents, spreadsheets, structured text, and source code;
-- OCR image-only PDFs when enabled;
-- build a local full-text search index;
-- ask a small model running through Ollama to inspect likely sources;
-- verify quoted findings against the extracted source text; and
-- send only the most useful evidence to the main agent.
-
-The original evidence remains available. Codex can retrieve a full record, add surrounding context, or open the source location when a finding needs closer inspection.
-
-## A simple example
-
-Suppose a folder contains 300 project documents and you want to know:
-
-> When was the project's completion date extended, and which document authorized the extension?
-
-Instead of asking the main agent to inspect all 300 documents, run:
-
-```sh
-repo-research --path ./project-documents \
-  --mode evidence \
-  --question "When was the completion date extended, and what authorized it?"
-```
-
-`repo-research` extracts and searches the files, asks the local model to examine likely passages, validates the quotations, and returns a concise report with source locations. The main agent can then focus its context on evaluating the answer rather than finding the documents.
-
-## Why not just use RAG?
-
-You can. This project is aimed at a narrower workflow: one-off research over a folder that may not deserve a permanent knowledge base.
-
-You might have downloaded a collection of papers, scraped a set of pages, or received a project archive that you need to investigate once. `repo-research` creates a local index for that material and acts as a research assistant for another AI agent. It also keeps stable evidence records and validates quotations, which makes it easier to inspect how an answer was assembled.
-
-## Privacy and requirements
-
-Extraction, indexing, OCR, and model inference run locally by default. Repository content is sent only to Ollama at `http://127.0.0.1:11434`; the package has no external model API integration. Changing `ollama_url` or choosing a cloud-backed model changes that privacy boundary.
-
-You need:
-
-- Python 3.10 or newer;
-- Ollama; and
-- a local model.
-
-The local model and context settings are configurable based on your available hardware.
 
 ## Install
 
-Start the Ollama service and download the default model:
+Requires Python 3.10+, Ollama, and two local models:
 
 ```sh
-if ! ollama list >/dev/null 2>&1; then
-  nohup ollama serve >/tmp/repo-research-ollama.log 2>&1 &
-  startup_attempt=0
-  until ollama list >/dev/null 2>&1; do
-    startup_attempt=$((startup_attempt + 1))
-    if [ "$startup_attempt" -ge 30 ]; then
-      tail -n 20 /tmp/repo-research-ollama.log >&2
-      exit 1
-    fi
-    sleep 1
-  done
-fi
+ollama serve
+# In another terminal:
 ollama pull qwen3.5:9b-mlx
-```
-
-Then install the command-line tool and bundled Codex skill:
-
-```sh
+ollama pull qwen3-embedding:0.6b
 ./install.sh
 repo-research --health
 ```
 
-`ollama serve` starts the HTTP service used by `repo-research`. `ollama run` opens an interactive model session and is not a substitute for that service.
+The installer supports `REPO_RESEARCH_INSTALL_ROOT`, `REPO_RESEARCH_BIN_DIR`, and
+`REPO_RESEARCH_SKILLS_DIR`. The default model names can be changed in configuration.
+Set `embedding_model: null` explicitly to use lexical retrieval alone. Hybrid mode
+reports a setup error if the embedding model is unavailable.
 
-The installer accepts `REPO_RESEARCH_INSTALL_ROOT`, `REPO_RESEARCH_BIN_DIR`, and `REPO_RESEARCH_SKILLS_DIR` if you want to change its user-local destinations.
+Extraction, indexes, embeddings, and inference use the local Ollama endpoint by
+default. Custom endpoints or cloud-backed models change that privacy boundary.
 
-## Common uses
-
-First inspect what the tool can read:
-
-```sh
-repo-research --path . --mode inventory
-```
-
-Then ask a focused question:
+## Research and inspect
 
 ```sh
-repo-research --path . --mode evidence \
-  --question "What evidence supports X?" \
-  --depth standard
+repo-research --path ./documents --mode inventory --json
+repo-research --path ./documents --mode evidence \
+  --question "What authorized the project extension?" --depth standard --json
 ```
 
-Add `--json` for machine-readable output or `--output-budget compact` for a smaller packet. Other research modes cover distinct tasks:
+The response uses schema **3.0**: a coverage overview, paginated propositions,
+bundle IDs, and explicit unresolved counts. Source passages stay in the local
+ledger until requested. A question-only call represents one proposition. For
+several questions, write a JSON list to `claims.json`:
+
+```json
+[
+  {"id":"P01","text":"What authorized the extension?"},
+  {"id":"P02","text":"Which conditions apply to the extension?"}
+]
+```
 
 ```sh
-# Look specifically for evidence against a claim
-repo-research --path . --mode contradictions \
-  --question "X happened in June 2025" --depth deep --fresh
-
-# Reconstruct a sequence of events
-repo-research --path . --mode chronology \
-  --question "Reconstruct the history of X"
-
-# Search broadly, identify gaps, or trace a claim to its original source
-repo-research --path . --mode exhaustive --question "Find all evidence about X" --depth deep
-repo-research --path . --mode gap-search --question "What is missing for X?" --existing-evidence @evidence.json
-repo-research --path . --mode source-trace --question "Find the original source for X"
+repo-research --path ./documents --mode evidence --propositions @claims.json --json
+repo-research --path ./documents --overview RUN_ID --cursor CURSOR --json
+repo-research --path ./documents --get-bundle BUNDLE_ID --run-id RUN_ID --json
+repo-research --path ./documents --get-bundle BUNDLE_ID --run-id RUN_ID --cursor CURSOR --json
+repo-research --path ./documents --resume RUN_ID --json
 ```
 
-Search depth controls how many retrieval strategies run: `quick` uses up to two, `standard` four, and `deep` seven. `--fresh` ignores reusable results, `--challenge-existing` performs an independent challenge search, and `--rebuild` re-extracts every supported source.
-
-## Inspecting evidence
-
-Each saved finding receives a stable ID such as `E0001`. Use that ID to inspect what lies behind the concise report:
+Bundles preserve full excerpts, relevant paragraphs, conditions, table headers,
+dates, source hashes, and locations. They expose supporting, qualifying, and adverse
+evidence together. Complete units paginate without character clipping. If one unit
+exceeds the delivery budget, the response identifies the evidence and required
+source inspection.
 
 ```sh
-repo-research --path . --get-evidence E0001 --json
-repo-research --path . --expand-evidence-context E0001 --radius 2 --json
-repo-research --path . --open-source-location E0001 --json
-repo-research --path . --show-related-evidence E0001 --json
-repo-research --path . --show-contradiction-evidence E0001 --json
-repo-research --path . --telemetry SEARCH_ID --json
+repo-research --path ./documents --get-evidence E0001 --run-id RUN_ID --json
+repo-research --path ./documents --expand-evidence-context E0001 --run-id RUN_ID --json
+repo-research --path ./documents --open-source-location E0001 --run-id RUN_ID --json
+repo-research --path ./documents --coverage-report RUN_ID --json
+repo-research --path ./documents --run-manifest RUN_ID --json
+repo-research --path ./documents --telemetry RUN_ID --json
 ```
 
-The Python API exposes the same basic workflow:
+The existing related-evidence and contradiction-evidence getters remain available.
+Legacy `E####` identifiers survive migration. The initial `evidence` array is empty
+in schema 3.0; consumers should follow proposition bundle IDs.
+
+## Python API
 
 ```python
-from repo_research import research, get_evidence, expand_evidence_context
+from repo_research import research, get_bundle, overview
 
 result = research(
-    path=".",
-    question="Find evidence about establishment and operation.",
-    mode="evidence",
-    depth="deep",
+    path="./documents", mode="evidence",
+    propositions=[{"id": "P01", "text": "What authorized the extension?"}],
 )
+bundle = get_bundle("./documents", result["search_id"],
+                    result["propositions"][0]["bundle_id"])
+# Follow next_cursor until the relevant overview/bundle has been inspected.
 ```
 
-## How it works
+## How bounded research works
 
-```text
-question
-   |
-   v
-extract files and preserve source locations
-   |
-   v
-build a SQLite full-text search index
-   |
-   v
-find likely passages for several search strategies
-   |
-   v
-local Ollama model examines the candidates
-   |
-   v
-quotations and locations are checked against source text
-   |
-   v
-useful findings are ranked, stored, and returned within a budget
-```
+The scheduler gives each proposition work fairly. It retrieves fresh candidates,
+extracts exact spans, performs a challenge search, follows requested context, and
+compares related original passages. Workers return candidate interpretations;
+Codex retains final judgment. Every relationship cites persisted evidence IDs.
 
-Output budgets apply only to the packet returned to the main agent: `compact` is about 750 tokens, `standard` about 1,500, and `expanded` about 4,000. Local indexing and model inference are not limited by this budget. Full validated evidence stays local; by default, no more than 12 ranked records are promoted, with important contradictions and qualifications retained alongside support.
+Processing stops after saturation, scope exhaustion, a budget, or a recorded
+failure. Pending work is resumable against the original corpus snapshot even if
+source files later change. Changed model identities require a new run.
 
-## Supported files
+| Depth | Maximum retrieval rounds per proposition | Generation calls per proposition |
+|---|---:|---:|
+| quick | 2 | 8 |
+| standard | 4 | 16 |
+| deep | 7 | 32 |
 
-Supported inputs include PDF, DOCX, XLSX/XLSM, CSV/TSV, plain text, Markdown, JSON, YAML, TOML, XML, HTML, LaTeX, BibTeX, logs, and common source-code formats.
+Defaults allow 12 candidates per retrieval page, 96 generation calls per invocation,
+eight context follow-ups per proposition, and one local worker. Embedding work is
+cached separately. Limits are configurable.
 
-The extractor preserves useful locations such as PDF pages, DOCX headings and paragraphs, spreadsheet sheets and rows, and source-code lines. Optional Tesseract OCR can read image-only PDFs without modifying the originals. Legacy `.xls` files are not supported.
+`compact`, `standard`, and `expanded` delivery budgets target approximately 750,
+1,500, and 4,000 tokens for the entire response. Overview delivery defaults to
+compact; bundle fetching defaults to expanded. Estimates are not exact Codex usage.
+Every model request preflights its schema, prompt, output reserve, and safety
+margin. Retries are preflighted; output exhaustion splits work once before an
+explicit failure. Oversized inputs are never silently discarded.
 
-## Local data and configuration
+## Coverage and interpretation
 
-Each researched folder receives a `.codex-research/` directory containing its configuration, SQLite index and cache, evidence records, promoted packets, search logs, telemetry, and other local research state. In a Git repository with an existing `.gitignore`, `.codex-research/` is added once.
+Coverage reports separate:
 
-Configuration is applied in this order:
+- **Processing:** whether scheduled tasks were completed and acknowledged.
+- **Search scope:** bounded retrieval or all eligible extracted passages screened.
+- **Evidence sufficiency:** findings and remaining gaps for each proposition.
 
-1. built-in defaults;
-2. `~/.config/repo-research/config.yaml`;
-3. a file passed with `--config`; and
-4. repository-specific configuration.
+`complete_for_retrieved_scope` establishes processing completion. It does not prove
+that every relevant passage was discovered. `exhaustive` enumerates every eligible
+extracted passage in the selected snapshot; budgets can defer remaining work.
+Even full screening can contain model classification errors. Exact-span validation
+establishes source fidelity, while interpretation remains provisional.
 
-You can configure the model, Ollama URL, include and exclude patterns, ignored directories, chunk sizes, candidate counts, and source hierarchy. SHA-256 hashes prevent stale source content from reusing old evidence. Search logs keep detailed candidate and inspection data locally; telemetry estimates local and frontier-facing research-context volume, not exact billing or Codex usage.
+Modes: `inventory`, `evidence`, `contradictions`, `chronology`, `exhaustive`,
+`gap-search`, and `source-trace`. Use `--fresh` or `--challenge-existing` to bypass
+model-output reuse, and `--rebuild` to force extraction.
 
-## Using it with Codex
+## Storage, configuration, and supported files
 
-The installer includes the `$local-repo-research` skill. Invoke it directly, or let Codex select it when a task involves many files, uncertain evidence locations, chronology, contradictions, or source tracing.
+Each researched folder receives `.codex-research/`. Its authoritative SQLite ledger
+stores snapshots, source structure, stable IDs, tasks, calls, evidence, relationships,
+and bundles. Search indexes and JSONL files are derived artifacts. Migration backs
+up existing audit databases before upgrading and preserves historical runs.
 
-For consequential claims, the final agent should still inspect the original source and search for contradictory evidence. Quote validation proves that text exists at a location; it does not prove that the claim is true.
+Configuration precedence is built-in defaults, `~/.config/repo-research/config.yaml`,
+explicit `--config`, then repository configuration. Embedding cache identities include
+source versions, model digests, and preprocessing versions. Optional exact local
+chat tokenization uses `pip install 'repo-research[tokenizer]'` and `tokenizer_path`.
 
-## Benchmarking
+Supported inputs include PDF, DOCX, XLSX/XLSM, CSV/TSV, plain text, Markdown,
+structured text, HTML, LaTeX, and common source formats. Image-only PDF OCR is opt-in
+and requires Poppler and Tesseract. Legacy `.xls` is unsupported. Extraction cannot
+establish signatures or legal effect; consequential claims require source inspection.
 
-Copy `benchmark/synthetic-spec.example.json`, set the repository and expected passages, then run:
+## Validation and benchmarks
 
 ```sh
-repo-research-benchmark benchmark.json --model qwen3.5:9b-mlx
+python3 -m pip install -e '.[dev]'
+python3 -m pytest
+repo-research-benchmark benchmark/synthetic-spec.example.json
 ```
 
-The benchmark reports known evidence recovered, false evidence, source-location accuracy, contradictions, runtime, and peak memory use.
+Tests cover cross-document context, qualifiers and denominators, whole-unit
+pagination, fair proposition coverage, pinned-snapshot resume, model cache
+invalidation, migrations, failed dispositions, and generation budgets.
 
-In the fixed ten-proposition SMEP economics benchmark, compact local screening reduced the conservative retrieved-candidate-text comparator by about 80%. Authority-sensitive and stage-sensitive claims still needed selective source inspection. This is one benchmark, not a general performance guarantee; see `benchmark/SMEP_ECONOMICS_2026-08-20.md` for its scope and measurements.
-
-## Limitations
-
-- Full-text retrieval can miss passages that share no terms with the question.
-- Small-model classifications can be wrong.
-- Quote validation confirms the source text, not the truth of an interpretation.
-- OCR must be enabled explicitly.
-- Source authority depends on the project and must be configured or judged.
+The older [SMEP economics benchmark](benchmark/SMEP_ECONOMICS_2026-08-20.md) describes
+the previous packet architecture. Its measurements are historical and are not
+performance guarantees for this release.

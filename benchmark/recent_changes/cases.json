@@ -1,0 +1,51 @@
+[
+  {
+    "id": "01-direct-date",
+    "question": "When did Cedar programme operations begin?",
+    "documents": {"cedar.txt": "Cedar programme operations began on 1 July 2023. The programme office is in Lakeside."},
+    "required": [{"source_path": "cedar.txt", "contains": "1 July 2023"}]
+  },
+  {
+    "id": "02-conditional-approval",
+    "question": "What does the Atlas extension approval allow and what condition applies?",
+    "documents": {"atlas.txt": "Board resolution dated 1 June 2025: The Atlas extension is approved until 31 December 2026 to complete regional consultations, procure the remaining equipment, consolidate the monitoring records and submit the programme's final technical report. This approval takes effect only after counterpart funding is secured."},
+    "required": [{"source_path": "atlas.txt", "contains": "31 December 2026"}, {"source_path": "atlas.txt", "contains": "only after counterpart funding is secured"}]
+  },
+  {
+    "id": "03-decimal-budget",
+    "question": "What exact budget was approved for the Larch programme?",
+    "documents": {"larch.txt": "The signed Larch programme agreement approves a budget of PHP 23.9 million. The amount is inclusive of administration costs."},
+    "required": [{"source_path": "larch.txt", "contains": "PHP 23.9 million"}]
+  },
+  {
+    "id": "04-delivery-percentage",
+    "question": "What is Pine programme cumulative delivery since inception?",
+    "documents": {"pine.txt": "Pine programme financial report for 2025: Annual delivery is 96 percent. Cumulative delivery since inception is 93.5 percent of the approved budget."},
+    "required": [{"source_path": "pine.txt", "contains": "Cumulative delivery since inception is 93.5 percent"}]
+  },
+  {
+    "id": "05-later-cancellation",
+    "question": "What is the status of the Willow extension approval?",
+    "documents": {"willow-approval.txt": "Board resolution dated 1 June 2025: The Willow extension is approved until 31 December 2026, subject to counterpart funding.", "willow-cancellation.txt": "Board resolution dated 2 July 2025: The prior Willow extension approval is cancelled because counterpart funding was not secured."},
+    "required": [{"source_path": "willow-approval.txt", "contains": "1 June 2025"}, {"source_path": "willow-cancellation.txt", "contains": "approval is cancelled"}]
+  },
+  {
+    "id": "06-proposal-versus-operation",
+    "question": "Has the Birch Unit begun operations?",
+    "documents": {"birch.txt": "A proposal to establish the Birch Unit was circulated on 15 March 2024. Establishment has not been approved and operations have not begun."},
+    "required": [{"source_path": "birch.txt", "contains": "operations have not begun"}]
+  },
+  {
+    "id": "07-two-questions",
+    "question": "What is the North programme budget?; When did the South programme close?",
+    "documents": {"north.txt": "The signed North programme agreement sets a budget of PHP 18 million.", "south.txt": "The approved South programme completion report records closure on 30 September 2025."},
+    "required": [{"source_path": "north.txt", "contains": "PHP 18 million"}, {"source_path": "south.txt", "contains": "30 September 2025"}]
+  },
+  {
+    "id": "08-no-answer-in-files",
+    "question": "When was the Juniper grant approved?",
+    "documents": {"unrelated.txt": "The Cedar programme held a staff workshop at Lakeside in June 2025. Attendance was recorded by the training coordinator."},
+    "required": [],
+    "expected_empty": true
+  }
+]

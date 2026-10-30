@@ -6,6 +6,7 @@ from pathlib import Path
 import pytest
 
 from repo_research.ollama import MockBackend
+from repo_research import get_bundle
 from repo_research.promotion import promote
 from repo_research.research import research
 from repo_research.retrieval import (contradiction_evidence, expand_evidence_context,
@@ -60,13 +61,13 @@ def test_research_persists_full_evidence_but_returns_compact_packet(corpus):
     persisted=[r for r in Store(corpus).read("evidence.jsonl") if r.get("search_id")==out["search_id"]]
     assert persisted
     assert len(out["evidence"]) <= 12
-    assert out["evidence_packet"]["estimated_tokens"] <= 750
+    assert out["estimated_tokens"] <= 750
     assert len(persisted) >= len(out["evidence"])
     assert all(re.fullmatch(r"E\d{4,}", r["id"]) for r in persisted)
     serialized=json.dumps(out)
     assert "large local context" not in serialized
     assert "candidate_files_considered" not in serialized
-    assert out["summary"]["evidence_records_persisted"] == len(persisted)
+    assert telemetry(corpus,out["search_id"])["evidence_records_persisted"] == len(persisted)
 
 
 def test_progressive_evidence_retrieval_and_telemetry(corpus):
@@ -75,7 +76,7 @@ def test_progressive_evidence_retrieval_and_telemetry(corpus):
                      backend=MockBackend(),output_budget="standard")
     research(corpus,q,mode="contradictions",depth="deep",fresh=True,
              backend=MockBackend(),output_budget="compact")
-    eid=support["evidence"][0]["id"]
+    eid=get_bundle(corpus,support["search_id"],support["propositions"][0]["bundle_id"])["units"][0]["id"]
     rec=get_evidence(corpus,eid)
     assert rec["id"]==eid and rec["source_path"]
     expanded=expand_evidence_context(corpus,eid,radius=1)
@@ -99,8 +100,8 @@ def test_output_budget_modes_have_expected_order(corpus):
     for budget in ("compact","standard","expanded"):
         out=research(corpus,"Reconstruct Atlas establishment and operation",mode="chronology",
                      depth="deep",fresh=True,backend=MockBackend(),output_budget=budget)
-        values.append(out["evidence_packet"]["budget_tokens"])
-        assert out["evidence_packet"]["estimated_tokens"] <= out["evidence_packet"]["budget_tokens"]
+        values.append(out["budget_tokens"])
+        assert out["estimated_tokens"] <= out["budget_tokens"]
     assert values == [750,1500,4000]
 
 
@@ -110,5 +111,5 @@ def test_all_research_modes_still_return_budgeted_packets(corpus, mode):
                  depth="quick",fresh=True,backend=MockBackend(),output_budget="compact",
                  existing_evidence="The operation date remains uncertain" if mode=="gap-search" else None)
     assert out["mode"]==mode
-    assert out["evidence_packet"]["estimated_tokens"] <= 750
-    assert "telemetry" in out and "summary" in out
+    assert out["estimated_tokens"] <= 750
+    assert "coverage" in out and out["schema_version"] == "3.0"

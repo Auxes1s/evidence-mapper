@@ -25,3 +25,10 @@ def test_span_id_selects_source_text_without_worker_copying_it():
     ev=_evidence_from_finding(finding,chunk,"q","m","s","context",spans=spans)
     assert ev and ev.excerpt == "Exact second sentence!"
     assert "deterministic_span_selection" in ev.validation_flags
+
+
+def test_span_selection_preserves_decimal_amounts_and_percentages():
+    text="Atlas funding is PHP 299.6 million. Cumulative delivery is 93.5 percent."
+    spans=_candidate_spans(Chunk("c","a.txt","txt","h",text,0))
+    assert [s["text"] for s in spans]==["Atlas funding is PHP 299.6 million.","Cumulative delivery is 93.5 percent."]
+    assert all(text[s["start"]:s["end"]]==s["text"] for s in spans)

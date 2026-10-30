@@ -1,16 +1,15 @@
 from __future__ import annotations
 
-import hashlib, json, re, time, uuid
-from datetime import datetime, timezone
+import hashlib
+import json
+import re
 from pathlib import Path
+from datetime import datetime, timezone
 from typing import Any
 
-from .config import ensure_repo_config, load_config
 from .index import Index
 from .models import Chunk, Evidence
-from .ollama import Backend, OllamaBackend
-from .prompts import FINDINGS_SCHEMA, SYSTEM, task_instruction
-from .promotion import compact_record, estimate_tokens, promote
+from .prompts import PROMPT_VERSION, task_instruction
 from .store import Store
 
 MODES = {"inventory","evidence","contradictions","chronology","exhaustive","gap-search","source-trace"}
@@ -26,16 +25,28 @@ def _terms(question: str, strategy: str) -> list[str]:
     if "date" in strategy or "chronology" in strategy: phrases += re.findall(r"\b(?:19|20)\d{2}\b", question) + ["approved", "began", "operational", "completed"]
     if "contradiction" in strategy: phrases += ["however", "incorrect", "revised", "not completed", "delayed", "correction"]
     if "source tracing" in strategy: phrases += ["approved", "signed", "minutes", "memorandum", "resolution"]
-    return list(dict.fromkeys(x for x in phrases if x))[:24]
+    if "synonyms" in strategy: phrases += ["finding", "result", "outcome", "effect", "conclusion", "reported", "observed"]
+    if "entity" in strategy: phrases += [w.upper() for w in words if len(w) <= 8]
+    if strategy.startswith("model-suggested:"):
+        phrases += [x.strip() for x in strategy.split(":",1)[1].split("|") if x.strip()]
+    return list(dict.fromkeys(x for x in phrases if x))[:64]
 
-def _candidate_prompt(question: str, mode: str, strategy: str, chunks: list[Chunk], existing: str | None) -> str:
+def _candidate_prompt(question: str, mode: str, strategy: str, chunks: list[Chunk], existing: str | None,
+                      propositions: list[tuple[str,str]] | None = None) -> str:
     parts = [f"RESEARCH QUESTION: {question}", f"MODE: {mode}", f"STRATEGY: {strategy}", task_instruction(mode)]
-    parts.append("Return at most 8 strongest findings for this strategy. Preserve adverse evidence when present. Select one supplied span_id per finding. Do not copy or rewrite quotations.")
-    if existing: parts.append("EXISTING EVIDENCE OR GAP DESCRIPTION:\n" + existing[:8000])
+    if propositions:
+        parts.append("PROPOSITIONS:\n"+"\n".join(f"{pid}: {text}" for pid,text in propositions))
+    parts.append('Return all relevant findings in these candidates, bounded to 4 per candidate. Preserve adverse evidence. Each text label such as [S000] supplies the span_id "S000"; copy that ID into the finding. Never leave span_id empty. Assign the supplied proposition_id. Return one disposition for every candidate chunk_id. Do not copy or rewrite quotations.')
+    if existing: parts.append("EXISTING EVIDENCE OR GAP DESCRIPTION:\n" + existing)
     parts.append("CANDIDATES:")
     for c in chunks:
-        meta = {k:v for k,v in c.dict().items() if k != "text" and v not in (None,{},[])}
-        rendered = "\n".join(f"[{s['span_id']}] {s['text']}" for s in _candidate_spans(c))
+        meta = {k:v for k,v in c.dict().items() if k not in {"text","metadata"} and v not in (None,{},[])}
+        meta["parent_id"]=c.metadata.get("parent_id")
+        selected=c.metadata.get("selected_span_ids")
+        meta["allowed_span_ids"]=[s["span_id"] for s in _candidate_spans(c)
+                                  if selected is None or s["span_id"] in selected]
+        rendered = "\n".join(f"[{s['span_id']}] {s['text']}" for s in _candidate_spans(c)
+                             if selected is None or s["span_id"] in selected)
         parts.append(f"--- CANDIDATE {json.dumps(meta, ensure_ascii=False)} ---\nTEXT:\n{rendered}")
     return "\n\n".join(parts)
 
@@ -62,6 +73,9 @@ def _normalize_worker_finding(finding: dict[str, Any]) -> dict[str, Any]:
     out.setdefault("qualification", "")
     out.setdefault("contradiction", "")
     out.setdefault("short_note", "Exact candidate passage returned by the local worker.")
+    for key in ("qualification","contradiction"):
+        if str(out[key]).strip().lower() in {"none","n/a","not applicable","null"}:
+            out[key]=""
     return out
 
 def _decompose_claim(question: str) -> list[str]:
@@ -71,7 +85,7 @@ def _decompose_claim(question: str) -> list[str]:
 
 def _candidate_spans(chunk: Chunk) -> list[dict[str, Any]]:
     """Deterministic sentence/line spans that the worker can select by ID."""
-    boundaries = list(re.finditer(r"[^\n.!?]+(?:[.!?]+(?=\s|$)|\n|$)", chunk.text))
+    boundaries = list(re.finditer(r"[^\n]+?(?:[.!?]+(?=\s|$)|(?=\n)|$)", chunk.text))
     out = []
     for match in boundaries:
         text = match.group().strip()
@@ -82,25 +96,39 @@ def _candidate_spans(chunk: Chunk) -> list[dict[str, Any]]:
     return out or [{"span_id":"S000", "text":chunk.text,
                     "start":0, "end":len(chunk.text)}]
 
-def _diverse_candidates(index: Index, propositions: list[str], strategy: str, limit: int) -> list[Chunk]:
-    pools = [index.search(_terms(p, strategy), limit) for p in propositions]
-    out, hashes, paths = [], set(), set()
+def _diverse_candidates(index: Index, propositions: list[str], strategy: str, limit: int,
+                        *, with_omitted: bool = False, embedding_model: str | None = None,
+                        embedder=None):
+    pools = [(index.hybrid_search(_terms(p,strategy),p,limit+1,embedding_model,embedder)
+              if embedding_model else index.search(_terms(p, strategy), limit + 1)) for p in propositions]
+    out, chunk_ids, canonical_path_by_hash = [], set(), {}
     while any(pools) and len(out) < limit:
         for pool in pools:
             while pool:
                 chunk = pool.pop(0)
-                if chunk.source_hash in hashes or chunk.source_path in paths: continue
-                hashes.add(chunk.source_hash); paths.add(chunk.source_path); out.append(chunk); break
+                if chunk.chunk_id in chunk_ids: continue
+                canonical=canonical_path_by_hash.get(chunk.source_hash)
+                if canonical is not None and canonical != chunk.source_path: continue
+                canonical_path_by_hash.setdefault(chunk.source_hash,chunk.source_path)
+                chunk_ids.add(chunk.chunk_id); out.append(chunk); break
             if len(out) >= limit: break
-    return out
+    omitted=[]
+    seen=set(chunk_ids)
+    for pool in pools:
+        for chunk in pool:
+            if chunk.chunk_id not in seen:
+                omitted.append(chunk); seen.add(chunk.chunk_id)
+    return (out,omitted) if with_omitted else out
 
 def _evidence_from_finding(f: dict, chunk: Chunk, question: str, model: str, search_id: str,
-                           context: str, spans: list[dict[str, Any]] | None = None) -> Evidence | None:
+                           context: str, spans: list[dict[str, Any]] | None = None,
+                           *, call_id: str = "", proposition_id: str = "") -> Evidence | None:
     excerpt = str(f.get("excerpt", "")).strip()
-    flags = []
+    flags = []; selected_span=None
     if f.get("span_id"):
         selected = {s["span_id"]:s for s in (spans or _candidate_spans(chunk))}.get(str(f["span_id"]))
         if not selected: return None
+        selected_span=selected
         excerpt = selected["text"]
         flags.append("deterministic_span_selection")
     if not excerpt:
@@ -122,7 +150,8 @@ def _evidence_from_finding(f: dict, chunk: Chunk, question: str, model: str, sea
     if et not in allowed_types: flags.append("unsupported_evidence_type"); et = "contextual"
     if stage not in allowed_stages: flags.append("unsupported_stage"); stage = "other"
     now = datetime.now(timezone.utc).isoformat()
-    eid = hashlib.sha256(f"{question}\x1f{chunk.source_path}\x1f{chunk.source_hash}\x1f{excerpt}".encode()).hexdigest()[:24]
+    span_id = str(f.get("span_id", ""))
+    eid = hashlib.sha256(f"{question}\x1f{proposition_id}\x1f{chunk.chunk_id}\x1f{span_id}\x1f{excerpt}".encode()).hexdigest()[:24]
     return Evidence(eid, question, str(f.get("topic","")), chunk.source_path, chunk.source_type,
         excerpt, context, str(f.get("relevance","candidate")), str(f.get("short_note","")), model,
         now, chunk.source_hash, search_id, page=chunk.page, sheet=chunk.sheet, section=chunk.section,
@@ -130,7 +159,11 @@ def _evidence_from_finding(f: dict, chunk: Chunk, question: str, model: str, sea
         paragraph_start=chunk.paragraph_start, paragraph_end=chunk.paragraph_end,
         document_date=f.get("document_date"), event_date=f.get("event_date"), evidence_type=et, stage=stage,
         qualification=str(f.get("qualification","")), contradiction=str(f.get("contradiction","")),
-        quote_verified=True, validation_flags=flags, fingerprint=eid)
+        quote_verified=True, validation_flags=flags, fingerprint=eid,
+        proposition_id=proposition_id, chunk_id=chunk.chunk_id, span_id=span_id,
+        call_id=call_id, prompt_version=PROMPT_VERSION,
+        span_char_start=selected_span["start"] if selected_span else None,
+        span_char_end=selected_span["end"] if selected_span else None)
 
 def _reuse(store: Store, index: Index, question: str) -> list[dict]:
     hashes = index.source_hashes(); out = []
@@ -145,156 +178,69 @@ def _inventory(index: Index, store: Store, stats: dict) -> dict:
     families: dict[str,int] = {}
     for s in sources: families[s["source_type"]] = families.get(s["source_type"],0)+1
     years, entities = set(), {}
-    for c in index.all_chunks(limit=300):
+    total_chunks=index.text_stats()["chunks"]
+    scanned=index.all_chunks(limit=300)
+    for c in scanned:
         years.update(re.findall(r"\b(?:19|20)\d{2}\b", c.text))
         for name in re.findall(r"\b[A-Z][A-Za-z&.-]+(?:\s+[A-Z][A-Za-z&.-]+){1,4}\b", c.text): entities[name] = entities.get(name,0)+1
     likely = [s["source_path"] for s in sources if re.search(r"signed|approved|minutes|resolution|report|official|memorandum", s["source_path"], re.I)][:12]
     return {"file_families": families, "likely_authoritative_sources": likely,
             "date_range": [min(years),max(years)] if years else [],
             "major_entities": [x[0] for x in sorted(entities.items(), key=lambda x:x[1], reverse=True)[:12]],
+            "metadata_chunks_scanned":len(scanned),"metadata_chunks_total":total_chunks,
+            "metadata_scan_complete":len(scanned)==total_chunks,
             "extraction_failures": stats["extraction_failures"]}
 
-def research(path: str | Path, question: str | None = None, mode: str = "inventory", depth: str = "standard",
-             *, fresh: bool = False, challenge_existing: bool = False, existing_evidence: str | None = None,
-             config_path: str | Path | None = None, backend: Backend | None = None,
-             rebuild: bool = False, output_budget: str | None = None) -> dict[str, Any]:
-    root = Path(path).expanduser().resolve()
-    if not root.is_dir(): raise ValueError(f"Not a directory: {root}")
-    if mode not in MODES: raise ValueError(f"Unknown mode: {mode}")
-    if depth not in DEPTH_PASSES: raise ValueError(f"Unknown depth: {depth}")
-    if mode != "inventory" and not question: raise ValueError(f"--question is required for {mode}")
-    cfg = load_config(root, config_path); ensure_repo_config(root, cfg)
-    budget_name = output_budget or cfg.get("frontier_output_budget", "standard")
-    budgets = cfg.get("frontier_output_budgets", {})
-    if budget_name not in budgets: raise ValueError(f"Unknown output budget: {budget_name}")
-    budget_tokens = int(budgets[budget_name])
-    store, started = Store(root), time.monotonic(); index = Index(root, store)
-    stats = index.build(cfg, force=rebuild)
-    sid = uuid.uuid4().hex
-    result: dict[str, Any] = {"schema_version":"1.1", "search_id":sid, "repository":str(root),
-                              "question":question, "mode":mode, "depth":depth, "model":cfg["model"],
-                              "output_budget":budget_name}
-    if question: result["propositions"] = _decompose_claim(question)
-    if mode == "inventory":
-        result["inventory"] = _inventory(index, store, stats); evidence_records = []; strategies = ["deterministic inventory"]
-        reused = []; candidate_paths=set(); inspected=set(); no_results=[]; rejected=[]
-        qwen_generations=0; candidate_text_chars=0; usage=[]; generated_count=0
-    else:
-        reused = [] if fresh or challenge_existing else _reuse(store, index, question or "")
-        evidence, strategies, inspected, candidate_paths, no_results, rejected = [], [], set(), set(), [], []
-        worker = backend or OllamaBackend(cfg)
-        propositions = _decompose_claim(question or "")
-        persisted_malformed = 0
-        qwen_generations, candidate_text_chars = 0, 0
-        pass_count = DEPTH_PASSES[depth]
-        if mode == "contradictions": chosen = STRATEGIES[4:5] + STRATEGIES[:max(0,pass_count-1)]
-        elif mode == "source-trace": chosen = STRATEGIES[5:6] + STRATEGIES[:max(0,pass_count-1)]
-        elif mode == "gap-search": chosen = STRATEGIES[6:7] + STRATEGIES[:max(0,pass_count-1)]
-        else: chosen = STRATEGIES[:pass_count]
-        for strategy in chosen:
-            strategies.append(strategy)
-            chunks = _fit_chunks(_diverse_candidates(index, propositions, strategy, cfg["candidate_limit"]), cfg["max_prompt_chars"])
-            candidate_paths.update(c.source_path for c in chunks)
-            if not chunks: no_results.append(strategy); continue
-            inspected.update(c.source_path for c in chunks)
-            candidate_text_chars += sum(len(c.text) for c in chunks)
-            qwen_generations += 1
-            try:
-                response = worker.generate_json(SYSTEM, _candidate_prompt(question or "", mode, strategy, chunks, existing_evidence), FINDINGS_SCHEMA)
-            finally:
-                failures = list(getattr(worker, "malformed_log", []))[persisted_malformed:]
-                for failure in failures:
-                    store.append("qwen_failures.jsonl", {"search_id":sid,"strategy":strategy,
-                        "timestamp":datetime.now(timezone.utc).isoformat(), **failure})
-                persisted_malformed += len(failures)
-            by_id = {c.chunk_id:c for c in chunks}
-            found_this = 0
-            for raw_finding in response.get("findings", []):
-                finding = _normalize_worker_finding(raw_finding)
-                chunk = by_id.get(finding.get("chunk_id"))
-                if not chunk:
-                    rejected.append({"strategy":strategy,"reason":"unknown_chunk_id","finding":finding}); continue
-                expanded = index.expand(chunk, cfg["context_expansion"])
-                context = "\n\n".join(x.text for x in expanded)
-                ev = _evidence_from_finding(finding, chunk, question or "", worker.model, sid, context,
-                                            spans=_candidate_spans(chunk))
-                if ev: evidence.append(ev); found_this += 1
-                else: rejected.append({"strategy":strategy,"reason":"excerpt_not_found_in_candidate","chunk_id":chunk.chunk_id,
-                                       "source_path":chunk.source_path,"span_id":finding.get("span_id"),
-                                       "excerpt":finding.get("excerpt","")})
-            if not found_this: no_results.append(strategy)
-        generated_count = len(evidence)
-        unique = {e.id:e for e in evidence}; evidence = list(unique.values())
-        evidence_records = store.assign_evidence_ids([e.dict() for e in evidence])
-        store.append_many("evidence.jsonl", evidence_records)
-        if mode == "chronology": store.append_many("chronology.jsonl", evidence_records)
-        usage = list(getattr(worker, "usage_log", []))[-qwen_generations:] if qwen_generations else []
-        if rejected: store.append_many("unresolved.jsonl", ({"search_id":sid, **x} for x in rejected))
-    elapsed = round(time.monotonic()-started,3)
-    coverage = {"repository_files_indexed":len(store.read("source_index.jsonl")),
-                "candidate_files":len(candidate_paths), "files_substantively_inspected":len(inspected),
-                "search_strategies":len(strategies), "extraction_failures":len(stats["extraction_failures"])}
-    gaps = [f"No validated evidence returned for strategy: {x}" for x in no_results]
-    if rejected: gaps.append(f"{len(rejected)} candidate findings rejected during quotation/provenance validation")
-    packet = promote(evidence_records, budget_name=budget_name, budget_tokens=budget_tokens,
-                     max_records=int(cfg.get("max_promoted_records",12)), coverage=coverage, gaps=gaps)
-    promoted_ids=set(packet["promoted_ids"])
-    promoted=[r for group in (packet["best_support"],packet["best_qualification"],
-                              packet["best_contradiction"],packet["other_promoted"]) for r in group]
-    # Reused evidence is reported by ID/path only; never dump the persistent record set again.
-    reused_compact=[{"id":r.get("id"),"source_path":r.get("source_path")} for r in reused[:int(cfg.get("max_promoted_records",12))]]
-    index_text=index.text_stats()
-    input_tokens=sum(int(x.get("input_tokens") or 0) for x in usage)
-    output_tokens=sum(int(x.get("output_tokens") or 0) for x in usage)
-    inference_seconds=round(sum(float(x.get("elapsed_seconds") or 0) for x in usage),3)
-    candidate_hash_list=sorted({index.source_hashes().get(p, "") for p in candidate_paths if index.source_hashes().get(p)})
-    telemetry_record={
-        "search_id":sid, "source_files_indexed":coverage["repository_files_indexed"],
-        "candidate_files":coverage["candidate_files"], "files_substantively_inspected_locally":coverage["files_substantively_inspected"],
-        "corpus_extracted_characters_indexed":index_text["characters"],
-        "estimated_corpus_tokens_indexed":max(1,index_text["characters"]//4),
-        "local_extracted_text_characters_processed":candidate_text_chars,
-        "estimated_local_input_tokens_processed":input_tokens or max(0,candidate_text_chars//4),
-        "qwen_generations":qwen_generations, "estimated_local_model_output_tokens":output_tokens,
-        "qwen_failures":len(getattr(worker, "malformed_log", [])) if mode != "inventory" else 0,
-        "candidate_source_hashes":len(candidate_hash_list), "candidate_source_hash_list":candidate_hash_list,
-        "elapsed_local_inference_seconds":inference_seconds,
-        "evidence_records_generated":generated_count,
-        "evidence_records_persisted":len(evidence_records),
-        "evidence_records_promoted":len(promoted_ids),
-        "estimated_promoted_tokens":packet["estimated_tokens"],
-        "additional_source_expansions":0, "estimated_expansion_tokens":0,
-        "estimated_total_frontier_research_tokens":packet["estimated_tokens"],
-        "estimated_corpus_to_promoted_compression":round((max(1,index_text["characters"]//4))/packet["estimated_tokens"],2) if packet["estimated_tokens"] else None,
-        "estimated_corpus_to_frontier_compression":round((max(1,index_text["characters"]//4))/packet["estimated_tokens"],2) if packet["estimated_tokens"] else None,
-        "elapsed_job_seconds":elapsed,
-        "estimate_note":"Token and compression figures are approximate research-context estimates, not API billing or exact Codex usage.",
-    }
-    store.append("packets.jsonl", {"search_id":sid,"question":question,"packet":packet})
-    store.append("telemetry.jsonl", telemetry_record)
-    public_packet={"budget":packet["budget"],"budget_tokens":packet["budget_tokens"],
-                   "coverage":packet["coverage"],"best_support":[r["id"] for r in packet["best_support"]],
-                   "best_qualification":[r["id"] for r in packet["best_qualification"]],
-                   "best_contradiction":[r["id"] for r in packet["best_contradiction"]],
-                   "other_promoted":[r["id"] for r in packet["other_promoted"]],
-                   "unresolved_gaps":packet["unresolved_gaps"],"promoted_ids":packet["promoted_ids"],
-                   "estimated_tokens":packet["estimated_tokens"]}
-    result.update({"evidence_packet":public_packet,"evidence":promoted,"reused_evidence":reused_compact,
-                   "reused_evidence_count":len(reused),"telemetry":telemetry_record})
-    summary = {"repository_files_indexed":len(store.read("source_index.jsonl")),
-               "potentially_relevant_files":len(candidate_paths),
-               "files_substantively_inspected":len(inspected),
-               "evidence_records_generated":generated_count,
-               "evidence_records_persisted":len(evidence_records),
-               "evidence_records_returned":len(promoted),
-               "contradictory_or_qualifying_records":sum(r.get("evidence_type") in {"contradictory","qualifying"} for r in evidence_records),
-               "extraction_failures":len(stats["extraction_failures"]), "elapsed_seconds":elapsed}
-    result["summary"] = summary
-    log = {"search_id":sid,"question":question,"mode":mode,"depth":depth,
-           "timestamp":datetime.now(timezone.utc).isoformat(),"model":cfg["model"],"search_strategies":strategies,
-           "candidate_files_considered":sorted(candidate_paths),"files_actually_inspected":sorted(inspected),
-           "evidence_persisted":[r["id"] for r in evidence_records],"evidence_promoted":packet["promoted_ids"],
-           "no_result_queries":no_results,"rejected_findings":rejected,
-           "source_hashes":index.source_hashes(),"elapsed_seconds":elapsed}
-    store.append("searches.jsonl", log)
-    return result
+
+def _snapshot_identity(root: Path, cfg: dict[str, Any], manifest: list[dict[str, Any]]) -> tuple[str,str,dict[str,Any]]:
+    policy={k:cfg.get(k) for k in ("include","exclude","ignore_dirs","max_file_bytes","chunk_chars",
+                                    "chunk_overlap_chars","ocr_image_only_pdfs","ocr_max_pages")}
+    payload=json.dumps({"root":str(root),"policy":policy,"files":manifest},ensure_ascii=False,
+                       sort_keys=True,separators=(",",":"))
+    digest=hashlib.sha256(payload.encode()).hexdigest()
+    return digest[:24],digest,policy
+
+
+def _proposition_pairs(question: str) -> list[tuple[str,str]]:
+    return [(f"P{i:03d}", text) for i,text in enumerate(_decompose_claim(question),1)]
+
+
+def _assign_proposition(finding: dict[str,Any], pairs: list[tuple[str,str]], excerpt: str) -> tuple[str,bool]:
+    supplied=str(finding.get("proposition_id", ""))
+    valid={pid for pid,_ in pairs}
+    if supplied in valid:
+        return supplied,False
+    words=set(re.findall(r"[a-z0-9]{3,}",excerpt.lower()))
+    ranked=sorted(((len(words & set(re.findall(r"[a-z0-9]{3,}",text.lower()))),pid) for pid,text in pairs),reverse=True)
+    return (ranked[0][1] if ranked else "P000"),True
+
+
+def _build_claims(run_id: str, pairs: list[tuple[str,str]], records: list[dict[str,Any]],
+                  source_hashes: dict[str,str]) -> list[dict[str,Any]]:
+    claims=[]
+    for pid,text in pairs:
+        related=[r for r in records if r.get("proposition_id")==pid]
+        support=[r["id"] for r in related if r.get("evidence_type") in {"direct","indirect","contextual","retrospective"}]
+        contradiction=[r["id"] for r in related if r.get("evidence_type")=="contradictory" or r.get("contradiction")]
+        qualification=[r["id"] for r in related if r.get("evidence_type")=="qualifying" or r.get("qualification")]
+        if support and contradiction: status="mixed_evidence"
+        elif support: status="supporting_evidence_present"
+        elif contradiction: status="contradicting_evidence_present"
+        else: status="unresolved"
+        verified=bool(related) and all(r.get("quote_verified") and r.get("chunk_id") and
+            source_hashes.get(r.get("source_path"))==r.get("source_hash") for r in related)
+        claims.append({"claim_id":hashlib.sha256(f"{text}".encode()).hexdigest()[:24],
+                       "proposition_id":pid,"claim_text":text,"status":status,
+                       "verification_status":"verified" if verified else "unresolved",
+                       "verification_scope":"source_links_and_exact_spans_only",
+                       "evidence":{"support":support,"qualification":qualification,"contradiction":contradiction}})
+    return claims
+
+def research(path, question=None, mode="inventory", depth="standard", *, fresh=False,
+             challenge_existing=False, existing_evidence=None, config_path=None,
+             backend=None, rebuild=False, output_budget=None, propositions=None, resume=None):
+    """Run bounded research and return a v3 overview; fetch evidence with get_bundle."""
+    from .engine import run_research
+    return run_research(path,question,mode,depth,fresh=fresh,challenge_existing=challenge_existing,
+                        existing_evidence=existing_evidence,config_path=config_path,backend=backend,
+                        rebuild=rebuild,output_budget=output_budget,propositions=propositions,resume=resume)

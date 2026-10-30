@@ -1,13 +1,15 @@
 from __future__ import annotations
 
 import json
+from collections.abc import Iterable
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any
 
 FILES = ["source_index.jsonl", "evidence.jsonl", "chronology.jsonl", "entities.jsonl",
          "searches.jsonl", "unresolved.jsonl", "extraction_failures.jsonl",
          "evidence_ids.jsonl", "packets.jsonl", "telemetry.jsonl", "expansions.jsonl",
          "qwen_failures.jsonl"]
+FILES.append("promotion_omissions.jsonl")
 
 class Store:
     def __init__(self, root: Path):
@@ -31,9 +33,10 @@ class Store:
         out = []
         path = self.state / name
         if not path.exists(): return out
-        for line in path.read_text(encoding="utf-8").splitlines():
+        for line_no, line in enumerate(path.read_text(encoding="utf-8").splitlines(), 1):
             try: out.append(json.loads(line))
-            except json.JSONDecodeError: continue
+            except json.JSONDecodeError as exc:
+                raise ValueError(f"Corrupt JSONL record in {path} at line {line_no}: {exc}") from exc
         return out
 
     def replace(self, name: str, records: Iterable[dict[str, Any]]) -> None:
@@ -44,26 +47,13 @@ class Store:
 
     def assign_evidence_ids(self, records: list[dict[str, Any]]) -> list[dict[str, Any]]:
         """Assign repository-stable human-facing E#### IDs to evidence fingerprints."""
-        mappings = self.read("evidence_ids.jsonl")
-        by_fingerprint = {x["fingerprint"]: x["evidence_id"] for x in mappings
-                          if x.get("fingerprint") and x.get("evidence_id")}
-        used = [int(x[1:]) for x in by_fingerprint.values()
-                if isinstance(x, str) and x.startswith("E") and x[1:].isdigit()]
-        next_id = max(used, default=0) + 1
-        created = []
-        out = []
-        for original in records:
-            rec = dict(original)
-            fingerprint = rec.get("fingerprint") or rec.get("id", "")
-            evidence_id = by_fingerprint.get(fingerprint)
-            if not evidence_id:
-                evidence_id = f"E{next_id:04d}"
-                next_id += 1
-                by_fingerprint[fingerprint] = evidence_id
-                created.append({"fingerprint": fingerprint, "evidence_id": evidence_id})
-            rec["fingerprint"] = fingerprint
-            rec["id"] = evidence_id
-            out.append(rec)
-        if created:
-            self.append_many("evidence_ids.jsonl", created)
-        return out
+        from .workspace import Workspace
+        ledger = Workspace(self.state)
+        try:
+            assigned = ledger.assign_ids(records)
+            mappings = [{"fingerprint": r[0], "evidence_id": r[1]} for r in
+                        ledger.db.execute("SELECT fingerprint,evidence_id FROM evidence_ids ORDER BY evidence_id")]
+            self.replace("evidence_ids.jsonl", mappings)
+            return assigned
+        finally:
+            ledger.db.close()

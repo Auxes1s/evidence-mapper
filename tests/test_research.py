@@ -8,7 +8,17 @@ from openpyxl import Workbook
 from reportlab.pdfgen.canvas import Canvas
 
 from repo_research.ollama import MockBackend
-from repo_research.research import _decompose_claim, research
+from repo_research.research import _decompose_claim, research as run_research
+from repo_research import run_manifest, telemetry
+
+def research(path,*args,**kwargs):
+    """Extraction assertions inspect the pinned full ledger, separately from delivery."""
+    out=run_research(path,*args,**kwargs)
+    manifest=run_manifest(path,out["search_id"])
+    out["evidence"]=manifest["evidence_records"]
+    out["telemetry"]=telemetry(path,out["search_id"])
+    if out["mode"]=="inventory": out["inventory"]=manifest["research_state"]["inventory"]
+    return out
 
 @pytest.fixture()
 def corpus(tmp_path: Path) -> Path:
@@ -45,22 +55,21 @@ def test_persistence_staleness_and_fresh(corpus):
     first=research(corpus,q,mode="evidence",depth="quick",fresh=True,backend=MockBackend())
     assert first["evidence"] and (corpus/".codex-research/evidence.jsonl").exists()
     reused=research(corpus,q,mode="evidence",depth="quick",backend=MockBackend())
-    assert reused["reused_evidence"]
+    assert reused["telemetry"]["qwen_generations"] == 0
     time.sleep(.01); (corpus/"primary.md").write_text("# Revised\nOperations began on 2 July 2023.\n",encoding="utf-8")
     after=research(corpus,q,mode="evidence",depth="quick",backend=MockBackend())
-    assert not any(x["source_path"]=="primary.md" for x in after["reused_evidence"])
+    assert all(x["source_hash"] != next(r["source_hash"] for r in first["evidence"] if r["source_path"]=="primary.md") for x in after["evidence"] if x["source_path"]=="primary.md")
     challenged=research(corpus,q,mode="evidence",depth="quick",challenge_existing=True,backend=MockBackend())
-    assert challenged["reused_evidence"] == []
+    assert challenged["telemetry"]["qwen_generations"] > 0
 
 def test_no_invented_sources_and_compound_partial_support(corpus):
-    out=research(corpus,"Atlas created the unit, doubled capacity, accelerated evaluations, and institutionalized evaluation",mode="exhaustive",depth="deep",fresh=True,backend=MockBackend())
+    out=research(corpus,"Atlas effects",propositions=[{"id":f"P{i}","text":text} for i,text in enumerate(["Atlas created the unit","Atlas doubled capacity","Atlas accelerated evaluations","Atlas institutionalized evaluation"])],mode="exhaustive",depth="deep",fresh=True,backend=MockBackend())
     actual={str(p.relative_to(corpus)) for p in corpus.rglob("*") if p.is_file()}
     assert all(x["source_path"] in actual for x in out["evidence"])
     assert len(out["propositions"]) >= 3
     assert not any("doubled" in x["excerpt"].lower() and x["evidence_type"]=="direct" for x in out["evidence"])
 
 def test_filesystem_timeout_isolated_and_index_progress_preserved(corpus, monkeypatch):
-    from repo_research import extract
     original_stat = Path.stat
     broken = corpus / "cloud-timeout.pdf"
     broken.write_bytes(b"placeholder")
@@ -113,13 +122,13 @@ def test_atomic_decomposition_preserves_dates_and_stage_contrasts():
     assert any("signed on 4 May 2022" in p for p in parts)
     assert any("execution began on 1 July 2022" in p for p in parts)
 
-def test_duplicate_source_hashes_are_retrieved_once_and_sources_are_diverse(corpus):
+def test_duplicate_source_occurrences_retain_provenance_and_hash_counts(corpus):
     (corpus/"duplicate-primary.md").write_bytes((corpus/"primary.md").read_bytes())
     out=research(corpus,"Atlas Unit approval and operations began",mode="evidence",depth="standard",fresh=True,backend=MockBackend())
     paths_by_hash={}
     for item in out["evidence"]:
         paths_by_hash.setdefault(item["source_hash"],set()).add(item["source_path"])
-    assert all(len(paths) == 1 for paths in paths_by_hash.values())
+    assert any({"primary.md","duplicate-primary.md"} <= paths for paths in paths_by_hash.values())
     assert out["telemetry"]["candidate_source_hashes"] == len(set(out["telemetry"]["candidate_source_hash_list"]))
     assert out["telemetry"]["candidate_files"] >= 2
 

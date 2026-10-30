@@ -9,7 +9,9 @@ skills_dir=${REPO_RESEARCH_SKILLS_DIR:-"${HOME}/.codex/skills"}
 venv_dir="${install_root}/venv"
 skill_target="${skills_dir}/local-repo-research"
 
-python3 -m venv "$venv_dir"
+if [ ! -x "$venv_dir/bin/python" ]; then
+  python3 -m venv "$venv_dir"
+fi
 "${venv_dir}/bin/python" -m pip install --upgrade "$script_dir"
 mkdir -p "$bin_dir" "$skills_dir"
 ln -sfn "${venv_dir}/bin/repo-research" "${bin_dir}/repo-research"

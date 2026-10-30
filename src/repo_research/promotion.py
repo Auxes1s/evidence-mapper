@@ -46,9 +46,12 @@ def _short(text: str, limit: int) -> str:
     return text if len(text) <= limit else text[:max(1, limit-1)].rstrip() + "…"
 
 def compact_record(record: dict[str, Any], detail: str = "standard") -> dict[str, Any]:
-    limits = {"compact": (180, 90), "standard": (320, 140), "expanded": (900, 320)}
+    limits = {"compact": (180, 32), "standard": (320, 120), "expanded": (900, 320)}
     excerpt_limit, note_limit = limits[detail]
     locator = _locator(record)
+    exact_excerpt = re.sub(r"\s+", " ", record.get("excerpt", "")).strip()
+    excerpt_preview = _short(exact_excerpt, excerpt_limit)
+    excerpt_truncated = excerpt_preview != exact_excerpt
     out = {
         "id": record["id"],
         "evidence_type": record.get("evidence_type"),
@@ -57,11 +60,15 @@ def compact_record(record: dict[str, Any], detail: str = "standard") -> dict[str
         "source_type": record.get("source_type"),
         "source_hash": record.get("source_hash"),
         "location": locator,
-        "excerpt": _short(record.get("excerpt", ""), excerpt_limit),
+        "excerpt": excerpt_preview,
+        "excerpt_truncated": excerpt_truncated,
         "note": _short(record.get("worker_note", ""), note_limit),
         "qualification": _short(record.get("qualification", ""), note_limit),
         "contradiction": _short(record.get("contradiction", ""), note_limit),
-        "quote_verified": bool(record.get("quote_verified")),
+        # Never label a shortened preview as an exact verified quotation. The
+        # evidence ID retrieves the full, validated source span.
+        "quote_verified": bool(record.get("quote_verified")) and not excerpt_truncated,
+        "source_span_verified": bool(record.get("quote_verified")),
         "authority_score": authority_score(record),
     }
     out.update(locator)  # preserve the established flat provenance fields too
@@ -115,11 +122,16 @@ def promote(records: list[dict[str, Any]], *, budget_name: str, budget_tokens: i
         elif rec["evidence_type"] == "direct": packet["best_support"].append(rec)
         else: packet["other_promoted"].append(rec)
     packet["promoted_ids"] = [r["id"] for r in promoted]
+    packet["records_available"] = len(records)
+    packet["records_promoted"] = len(promoted)
+    packet["records_omitted"] = max(0, len(records)-len(promoted))
     packet["estimated_tokens"] = estimate_tokens(packet)
     # Defensive hard stop: remove lowest-priority tail until serialization respects the budget.
     while packet["estimated_tokens"] > budget_tokens and packet["promoted_ids"]:
         rid = packet["promoted_ids"].pop()
         for key in ("best_support", "best_qualification", "best_contradiction", "other_promoted"):
             packet[key] = [r for r in packet[key] if r["id"] != rid]
+        packet["records_promoted"] = len(packet["promoted_ids"])
+        packet["records_omitted"] = max(0, len(records)-packet["records_promoted"])
         packet["estimated_tokens"] = estimate_tokens(packet)
     return packet

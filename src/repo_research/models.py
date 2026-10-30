@@ -57,4 +57,11 @@ class Evidence:
     validation_flags: list[str] = field(default_factory=list)
     stale: bool = False
     fingerprint: str = ""
+    proposition_id: str = ""
+    chunk_id: str = ""
+    span_id: str = ""
+    call_id: str = ""
+    prompt_version: str = ""
+    span_char_start: int | None = None
+    span_char_end: int | None = None
     def dict(self) -> dict[str, Any]: return asdict(self)
